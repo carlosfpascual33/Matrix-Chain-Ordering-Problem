@@ -1,0 +1,1930 @@
+---
+title: "High Performance Computing - Matrix Multiplication Assignment"
+format: 
+  html:
+    toc: true        
+    toc-depth: 4     
+    toc-location: left  
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+> **Warning:** This script should be compatible with all operating systems. If you encounter any issues, check the packages `parallel` and `RcppParallel`. Benchmarking results may vary depending on the computer's characteristics. All comments are based on the compiled HTML results.
+
+```{r Libraries, eval=TRUE, echo=FALSE}
+# Install and/or load the required libraries
+
+# Rcpp 
+if (!requireNamespace("Rcpp", quietly = TRUE)) {install.packages("Rcpp")}
+library(Rcpp)
+
+# RcppArmadillo for linear algebra operations
+if (!requireNamespace("RcppArmadillo", quietly = TRUE)) {install.packages("RcppArmadillo")}
+library(RcppArmadillo)
+
+# rbenchmark for benchmarking
+if (!requireNamespace("rbenchmark", quietly = TRUE)) {install.packages("rbenchmark")}
+library(rbenchmark)
+
+# parallel for parallelization in R 
+if (!requireNamespace("parallel", quietly = TRUE)) {install.packages("parallel")}
+library(parallel)
+
+# RcppParallel for parallelization in Rcpp
+if (!requireNamespace("RcppParallel", quietly = TRUE)) {install.packages("parallel")}
+library(RcppParallel)
+
+# knitr for styling the document
+if (!requireNamespace("knitr", quietly = TRUE)) {install.packages("knitr")}
+library(knitr)
+```
+
+# Introduction
+
+The problem analyzed in this project is that of *Matrix Chain Multiplication* or *Matrix Chain Ordering Problem (MCOP)*. Particularly, we will develop and implement in both `R` and `Rcpp` several algorithms which tackle the most efficient way to perform multiplication over a given sequence of matrices.
+
+**How does this problem arise?** Given any set of conformable matrices $A,B,C$, the matrix product is an associative operation: $(AB)C = A(BC)$. That is, as for the resulting matrix, it is irrelevant to perform first $(AB)$ and then multiply the resulting matrix by $C$ or the other way around.
+
+Although the resulting matrix is unaffected by the multiplication order, the number of operations to perform the configurations may differ.
+
+Consider the matrices $A_{r\times c}$ and $B_{c\times d}$, where the subindexes indicate their dimensions. Performing the product $AB$ requires $r\cdot c\cdot d$ multiplications, since $$AB = \left[ \sum_{k = 1}^c A_{i,k}\cdot B_{k,j} \right]_{i,j},\,\textrm{for}\; i = 1,\dots, r,\,j =1,\dots, d.$$
+
+Therefore, considering a product of three matrices $A_{r\times c}, B_{c\times d}$ and $C_{d\times e}$, we have two possible multiplication orders: $(AB)C$ and $A(BC)$. Using the previous idea recursively:
+
+-   $(AB)C$ requires $r\cdot c\cdot d$ to perform $W_{r\times d} = (AB)$ and then $r\cdot d \cdot e$ to perform $WC$. In total, this accounts for $r\cdot c\cdot d + r\cdot d \cdot e$ operations.
+
+-   $A(BC)$ requires $c\cdot d \cdot e$ to perform $U_{c\times e} = (BC)$ and then $r\cdot c \cdot e$ to perform $AU$. In total, this accounts for $c\cdot d \cdot e + r\cdot c \cdot e$ operations.
+
+The algorithms to be introduced in further sections aim precisely at, one way or another, select efficiently which of these configurations is the one which requires the least amount of operations (or,at least, find a coherent approximation to this minimum).
+
+**Why is this problem relevant?** From an amateur `R`-user standpoint, the computational cost arisen form performing a non-optimal multiplicative order is unnoticeable in most cases, since explicit matrix multiplication is done punctually in `R` and is often done behind the scenes in already-implemented functions. Nonetheless, matrix multiplication is a basic throughout STEM fields and in many (if not most) computer science algorithms. Given the wide range of situations in which matrix multiplication is present, makes it interesting to tackle the multiplicative order problem.
+
+Not only `R` is a language non-optimized for algebraic operations, most of the necessary matrix multiplications in the packages in `R` are carried out in `C++`, the base language of `R`, which is significantly faster for such tasks (Although both `R`and `C++` use `BLAS/LAPCK` as their linear algebra engines).
+
+Furthermore, in many computationally-intensive contexts like *Neural Networks (NNs)*, in which data processing and model training rely on systematic matrix multiplication, even a minor improvement in efficiency can have a meaningful impact on the performance of the algorithm.
+
+Particularly, for situations in which matrix sizes differ notably and in which the matrix chain is fairly large, the extra step of selecting a better multiplicative order can lead to significant computational gains.
+
+> Neural Network construction and training is a far more complex task than straightforward matrix multiplication. While the process typically requires intercalating multiplication steps with function compositions, the dimensions of modern NNs highlight the importance of optimization. For instance, GPT-3 utilizes 175 billion parameters, which (simplfying it a bit) are represented as matrices <https://en.wikipedia.org/wiki/GPT-3>. Logically, a simple enhancement such as the one analyzed in this project could have a significant impact, not only in the time required to construct and train the model, but also to minimize the natural resources used for this end. Check <https://www.deeplearningbook.org/> for more information in teh subject.
+
+# Task 1
+
+##### Play with random matrices of different dimensions and the matrix product in R to find a compelling example of the multiplication of 5 matrices in which the naive default ordering takes considerably more time than some custom parenthesization. Show this with a benchmark. Analyze the number of operations for each case and discuss the results.
+
+In the previous section we commented that the product order will be of great impact if both the number of matrices to multiply is relatively large and there are significant differences between their dimensions.
+
+To exemplify this behavior, we will begin by considering a chain of 5 matrices: $$ A_{500\times 10},\, B_{10\times 5},\, C_{5\times 30},\, D_{30\times 25}\;\textrm{and}\; E_{25,50}$$
+
+To simplify things, we will commence by considering three possible orders:
+
+-   $(((A B) C) D) E)$, the 'naive' approach, since we are directly performing multiplication left-to-right, which involves $500\cdot 10\cdot 5 + 500\cdot 5\cdot 30 + 500\cdot 30\cdot 25 + 500\cdot 25\cdot 50 = 1100000$ operations.
+
+-   $(A (B (C (D E)))$, the 'backwards' approach, which involves $30\cdot 25\cdot 50 + 5\cdot 30\cdot 50 + 10\cdot 5\cdot 50 + 500\cdot 10 \cdot 50 = 295500$ operations.
+
+-   $(A B) ((C D) E)$, a 'custom' selected order, which involves $500\cdot 10\cdot 5 + 5\cdot 30\cdot 25 + 5\cdot 25\cdot 50 + 500\cdot 5 \cdot 50 = 160000$ operations.
+
+Among the considered configurations, the 'custon' one requires the least operations and is therefore expected to be computationally much faster than the previous two. In particular, the 'naive' order involves almost 10 times the number of operations than those of the 'custom' one and the 'backwards' almost twice.
+
+Let's benchmark, for $n=1000$ repetitions, the time needed by `R` to perform this three products:
+
+```{r Naive Benchmark}
+# Size of the matrices
+n1 <- 500
+n2 <- 10  
+n3 <- 5  
+n4 <- 30 
+n5 <- 25  
+n6 <- 50 
+
+# Randomly generate the matrices
+A <- matrix(runif(n1*n2), nrow = n1, ncol = n2)
+B <- matrix(runif(n2*n3), nrow = n2, ncol = n3)
+C <- matrix(runif(n3*n4), nrow = n3, ncol = n4)
+D <- matrix(runif(n4*n5), nrow = n4, ncol = n5)
+E <- matrix(runif(n5*n6), nrow = n5, ncol = n6)
+
+# Benchmark the different multiplication methods
+naive  <- function() ((((A %*% B) %*% C) %*% D) %*% E)
+back   <- function() (A %*% (B %*% (C %*% (D %*% E))))
+custom <- function() (A %*% B) %*% ((C %*% D) %*% E)
+
+# Benchmark the three methods considered
+results = benchmark(
+  naive(),
+  back(),
+  custom(),
+  replications = 1000,
+  columns = c("test", "elapsed", "relative", "replications"),
+  order = "relative"
+)
+
+# Format the results
+names(results) = c('Order', 'Elapsed', 'Relative', 'Replications')
+results$Order = c('Custom', 'Backwards', 'Naive')
+row.names(results) = NULL
+results$Operations = c(160000, 295500, 1100000)
+# Display the styled table
+kable(results, caption = "Benchmark Results", align = "l", format = "markdown")
+```
+
+As expected, the 'custom' order is the most efficient, with the 'backwards' one being $133.33\%$ slower and the 'naive' $340\%$.
+
+In contrast to the number of operations, for which the 'naive' order in 10 times greater than the 'custom' order and the 'backwards' twice, the time required to perform these operations is significantly lower than these differences, potentially due to an inner parallelization in matrix products made automatically by `R`.
+
+Now, we haven't considered all possible arrangements for the multiplication $ABCDE$ and therefore, we could potentially find a better order.
+
+For a given chain of $n$ matrices $\left\{A_1,\dots,A_n\right\}$, the number of unique orderings for the product $A_1\cdot\dots\cdot A_n$ coincides with the *Catalan number* of order $n-1$. That is, we have $$C_{n-1} = \frac{1}{n}\binom{2(n-1)}{n-1} $$ possible configurations.
+
+Particularly, for $n=5$, which is the considered situation, there are $C_4 = 14$ possible orders, as listed below:
+
+```{r All Orders}
+full_pars <- data.frame( 
+  Order = c(
+    "(A(B(C(DE))))", "(A(B((CD)E))))", '(A((BC)(DE))', '(A((B(CD))E))',
+    '(A(((BC)D)E))', '(AB)(C(DE))', '(AB)((CD)E)', '(A(BC))(DE)', '((AB)C)(DE)',
+    '((A(B(CD)))E)', '((A((BC)D))E)', '((AB)(CD))E', '((A(BC))D)E)', 
+    '((((AB)C)D)E)'
+  ),
+  Operations = c(297500,  262500,  304000,  267500,  271500,  195000,  160000,  
+                 939000,  887500,  755000, 759000,  716250, 1151500, 1100000)
+)
+
+# Display the styled table
+kable(full_pars, caption = "Benchmark Results",align = "l",format = "markdown")
+```
+
+As we can see, the optimal parenthesization is the one we have considered initially: $(AB)((CD)E)$ and the naive approach is second-to-worst one, with a magnitude of operations over most of other arrengements.
+
+# Task 2
+
+##### Implement a C++ function that takes 5 matrices as input and multiplies them using RcppArmadillo without any parenthesization. Compare it with the previous ones in R (no parenthesization, best parenthesization). Discuss the results.
+
+Notice that the requested function coincides with the naive ordering and is easily implemented as follows:
+
+```{Rcpp Naive Rcpp}
+// Naive_Rcpp
+//
+// Function which, given 5 matrices in order, performs their naive 
+// multiplication order.
+//
+// **Input Parameters:**
+// 1. **A1, A2, A3, A4, A5**:  
+//    Matrices with conformable dimensions.
+//
+// **Output:**
+// Returns the result of A1*A2*A3*A4*A5
+//
+#include <RcppArmadillo.h> 
+// [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::export]]
+arma::mat Naive_Rcpp(const arma::mat& A1, const arma::mat& A2,
+                     const arma::mat& A3, const arma::mat& A4, 
+                     const arma::mat& A5){
+
+  // Directly multiply the matrices
+  arma::mat result = A1 * A2 * A3 * A4 * A5;
+
+  return result;
+}
+```
+
+Let's check if the code is working properly:
+
+```{r}
+# Check if the multiplication is correct (round for possible inaccuracies)
+all(round(A %*% B %*% C %*% D %*% E, 3) == round(Naive_Rcpp(A, B, C, D, E), 3))
+```
+
+`Rcpp` is a library which enables `C++` coding, which is a faster language for linear algebra operations (and in general, since it is a compiled, rather than interpreted language). As such, it is expected, to perform better at least than the naive order in `R`.
+
+Let's perform the same benchmarks we did previously:
+
+```{r Benchmark2}
+# Benchmark the three methods considered
+results = benchmark(
+  naive(),
+  custom(),
+  Naive_Rcpp(A,B,C,D,E),
+  replications = 1000,
+  columns = c("test", "elapsed", "relative", "replications"),
+  order = "relative"
+)
+
+# Format the results
+names(results) = c('Order', 'Elapsed', 'Relative', 'Replications')
+results$Order = c('Custom R', 'Naive Rcpp', 'Naive R')
+row.names(results) = NULL
+
+# Display the styled table
+kable(results,caption = "Naive Rcpp comparison",align = "l",format = "markdown")
+```
+
+As we can observe, the `Rcpp` implementation of the naive order performed significantly better than the `R` version. To be exact, it took a $47\%$ -less than half- of running time in `R`.
+
+This is mainly due to the fact that `C++` is a compiled language, so the code is compiled directly, unlike `R`, which need an intermediate step for 'translating' the code to compiler language. As well, there may be certain minor optimizations by using `RcppArmadillo` matrices.
+
+Nonetheless, it has performed worse than the optimal parenthesization in `R`, which evidences that the technicalities just commented aren't enough to oversee the ordering problem.
+
+# Task 3
+
+##### Implement a C++ function that takes a list of matrices and a vector defining the multiplication order, and performs the operations in the specified order using RcppArmadillo. Compare it with the previous case for the best parenthesization.
+
+Firstly, let's introduce the **notation we will be using to indicate a given parenthesization**:
+
+We will employ permutations of $1,2,\dots, n-1,$ where $n$ is the number of matrices in the multiplication. The elements in the vector will account for a given 'gap' between the matrices to be multiplied and the indexes of the vector will indicate the order to perform the matrix multiplications.
+
+As such, the first element of the given vector will be an integer $i\in\{1,\dots, n-1\}$ which indicates that the first multiplication to perform is between $A_i$ and $A_{i+1}$. Then, if the second element of the order were to be $i+1$, this indicates that the second operation to perform is $(A_iA_{i+1})A_{i+2}$, and so on.
+
+For instance, to represent the optimal ordering for the proposed problem $$(AB)((CD)E)$$ we could indicate $(1,3,4,2)$.
+
+Notice that the vector representing a given order isn't necessarily unique: since it is irrelevant to perform first $(AB)$ then $(CE)$ and then $((CD)E)$, we could have used $(3,1,4,2)$ or $(3,4,1,2)$. Although irrelevant at this stage, this will be an important issue in the following task.
+
+Some other examples would be
+
+-   $ABCDE\longrightarrow (1,2,3,4)$
+-   $A(B(C(DE))\longrightarrow (4,3,2,1)$
+-   $A(BC)DE \longrightarrow (2,1,3,4)$
+
+------------------------------------------------------------------------
+
+One established the notation, we can proceed to **explain the idea** behind the `Rcpp` function which performs matrix multiplication in a given order.
+
+The algorithm takes as input a list of matrices, given in their multiplicative order, `mat_list` and a vector `ord` indicating the parenthesization.
+
+Then initializes a Boolean vector `avail` where each entry is set to 1, indicating that the corresponding matrix in the list has not yet been used in a multiplication.
+
+The algorithm iterates over `ord`, in which `ord[i]` indicated the split at which to perform the i-th multiplication. It then multiplies the leftmost unused matrix at, or before, the position `ord[i]` with the unused matrix to its right. The product is stored in the left matrix, while the right matrix remains unchanged. However, its corresponding Boolean entry is updated to 0, marking it as used. That way, it is excluded from future multiplications. The Boolean value of the left matrix remains 1.
+
+Once iterated through all `ord`, all necessary multiplications have been completed. At this point, the first matrix in the remaining list contains the final result of the full product.
+
+Notice that we are using a boolean vector for availability to avoid modifying dynamically list dimensions, which is a noticeable detriment in an algorithm's efficiency.
+
+The **pseudocode for this algorithm** is:
+
+```         
+Input: list of matrices and `ord`
+
+1. Obtain n number of matrices to multiply. 
+2. Initialize `avail` = (1,...,1)
+3. For i in 1,...,n-1:
+
+    1. Retrieve `ord[i]`
+    2. Find the rightmost available matrix to the left (or itself) of `ord[i]` 
+    and the leftmost available matrix to the right.
+    3. Perform multiplication and store it in the left matrix
+    4. Set `avail` of the right matrix 0
+    
+4. Retrieve the full matrix product from the first resulting matrix in the list
+```
+
+```{Rcpp Order_Mat_Mult_Rcpp}
+// obtain_positions
+//
+// Auxiliary function which finds the indexes of positions i,j, satisfying:
+//    - i is the biggest index such that i <= pos and avail[i] = 1
+//    - j is the smallest index such that j > pos and avail[j] = 1
+//
+// **Input Parameters:**
+// 1. **index_mult**:  
+//    Vector of binary values indicating which positions of the vector 
+//    `positions` are available.
+//
+// 2. **positions**:  
+//    Vector of integers indicating the positions from which we need to retrieve
+//    `i` and `j`.
+//
+// 3. **pos**:  
+//    Integer which indicates the reference position used to determine the 
+//    values of `i` and `j`.
+//
+// **Output:**
+// Returns a vector of integers containing `i` and `j` (in that order).
+//
+#include <RcppArmadillo.h> 
+// [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::export]]
+Rcpp::IntegerVector obtain_positions(arma::uvec avail, 
+                                     Rcpp::IntegerVector positions, 
+                                     int pos){
+    // Initialize the indexes to be used
+    int i = -1, j = -1;
+
+    // Size of `positions`
+    int n_positions = positions.size();
+    
+    // Loop through `positions` to determine `i` and `j`
+    for(int k = 0; k < n_positions; k++){
+      // Check if index `k` is available
+      if (avail[k] == 1){
+        // Get the k-th position from the vector `positions`
+        int temp_position = positions[k];
+
+        // If the position is less or equal than `pos`, assign it to `i`
+        // Update the term `i` each time to get increasingly close to `pos`
+        if (temp_position <= pos){
+          i = temp_position;
+        } 
+
+        // Else, if the position is available and at the right, assign it to `j`
+        else { // Exit the loop the first time a `j` is found
+          j = temp_position;
+          break; 
+        }
+      }
+    }
+
+  // Return a vector of indexes `i` and `j`
+  return Rcpp::IntegerVector::create(i, j);
+}
+
+
+
+// Order_Mat_Mult_Rcpp
+//
+// Function which performs matrix multiplication in an indicated arrangement 
+//
+// **Input Parameters:**
+// 1. **mat_list**:  
+//    List containing an arbitrary number of matrices in adequate order of 
+//    multiplication
+//
+// 2. **ord**:  
+//    Vector of integers indicating in order the multiplication split to perform
+//    in the list of matrices
+//    Its size is one less than that of the list of matrices 
+//
+// **Output:**
+// Returns a matrix which is the result of multiplying all the matrices in the 
+// given list in the indicated order.
+//
+#include <RcppArmadillo.h> 
+// [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::export]]
+arma::mat Order_Mat_Mult_Rcpp(const Rcpp::List& mat_list, 
+                              const Rcpp::IntegerVector& ord){
+  
+  // Copy the input variables to avoid modifying the original ones
+  Rcpp::List mat_list2 = Rcpp::clone(mat_list);
+  
+  // Obtain the number of matrices to multiply and a positions vector
+  int n_mat = mat_list2.size();
+  Rcpp::IntegerVector positions = Rcpp::seq(0, n_mat - 1);
+
+  // Initialize a boolean Vector for matrix availability
+  arma::uvec avail(n_mat, arma::fill::ones);
+  
+  // Iterate through all positions of `ord`
+  for (int k = 0; k < n_mat - 1; k++){
+    // Obtain the position of the actual multiplication
+    int pos = ord[k] - 1;
+
+    // Obtain the indexes of the rightmost available matrix for left-side 
+    // multiplication and the leftmost available matrix for the right-side with
+    // respect to `pos`
+    Rcpp::IntegerVector pos_indexes = obtain_positions(avail, positions, pos);
+    int i = pos_indexes[0], j = pos_indexes[1];
+    
+    // Perform the multiplication and store it in the left matrix of the product
+    arma::mat matL = mat_list2[i];
+    arma::mat matR = mat_list2[j];
+    mat_list2[i] = matL * matR; 
+  
+    // Indicate the right matrix of the product has been used
+    avail[j] = 0;
+  }
+
+  // Obtain the resulting matrix
+  return mat_list2[0];
+}
+```
+
+Let's check if the code is working properly:
+
+```{r}
+# Check if the multiplication is correct (round for possible inaccuracies)
+# Data input for `Order_Mat_Mult_Rcpp`
+mat_list = list(A, B, C, D, E)
+custom_ord = c(1,3,4,2)
+all(round(A %*% B %*% C %*% D %*% E, 3) == round(Order_Mat_Mult_Rcpp(mat_list = mat_list, ord = custom_ord), 3))
+```
+
+As indicated, we will now compare the custom parenthesization in both `R` and in `Rcpp` using the previous function. Notice that the comparison is inherently unfair, since the `Rcpp` version does some extra calculations to perform the algorithm correctly and is more memory-intensive than the `R` version.
+
+```{r Benchmark3}
+# Data input for `Order_Mat_Mult_Rcpp`
+mat_list = list(A, B, C, D, E)
+custom_ord = c(1,3,4,2)
+
+# Benchmark the three methods considered
+results = benchmark(
+  custom(),
+  Order_Mat_Mult_Rcpp(mat_list = mat_list, ord = custom_ord),
+  replications = 1000,
+  columns = c("test", "elapsed", "relative", "replications"),
+  order = "relative"
+)
+
+# Format the results
+names(results) = c('Order', 'Elapsed', 'Relative', 'Replications')
+results$Order = c('Custom R', 'Custom Rcpp')
+row.names(results) = NULL
+
+# Display the styled table
+kable(results, caption = "Custom Rcpp comaprison", align = "l", 
+      format = "markdown")
+```
+
+As commented before, the direct implementation in `R` of the optimal arrangement is faster than the `Rcpp` version, mainly due to the extra calculations required by the function.
+
+As an estimation for how much computational cost and time these extra calculations and memory accesses hinder the function, we can compare directly in `Rcpp` the naive parenthesizations directly and via `Order_Mat_Mult_Rcpp`.
+
+```{r Benchmark4}
+# Data input for `Order_Mat_Mult_Rcpp`
+mat_list = list(A, B, C, D, E)
+naive_ord = c(1,2,3,4)
+
+# Benchmark the three methods considered
+results = benchmark(
+  Order_Mat_Mult_Rcpp(mat_list = mat_list, ord = naive_ord),
+  Naive_Rcpp(A,B,C,D,E),
+  replications = 1000,
+  columns = c("test", "elapsed", "relative", "replications"),
+  order = "relative"
+)
+
+# Format the results
+names(results) = c('Order', 'Elapsed', 'Relative', 'Replications')
+results$Order = c('Directly', 'Order_Mat_Mult_Rcpp')
+row.names(results) = NULL
+
+# Display the styled table
+kable(results, caption = "Rcpp comaprison", align = "l", format = "markdown")
+```
+
+As expected, the mean extra time taken by `Order_Mat_Mult_Rcpp` is on average $\frac{0.59-0.29}{1000}$ seconds slower. Equivalently, 2.03 times slower. Precisely, this is the **cost of using a general-situation algorithm**: by particularizing a function for a fixed parenthesization, it is evidently much faster, because that function **only** accounts for that precise situation and can avoid many steps/computations.
+
+# Task 4
+
+##### Investigate further in the scientific literature about the matrix chain ordering problem, specifically about the available algorithms. Implement at least one algorithm that solves the problem and produces a vector defining the multiplication order. Use it in conjunction with the function from task 3 to compare the approach of solving the matrix chain ordering problem and perform the product in the resulting order vs. R’s best and worst cases (task 1) vs. Armadillo’s naive approach (task 2).
+
+For this section, we will compare 4 different algorithms for the *Matrix Chain Ordering Problem (MCOP*): Two exact methods, namely the brute-force algorithm and the dynamic approach and two approximate algorithms, both variations of a greedy paradigm.
+
+We will initially implement them in both `R` and `Rcpp` and attempt to improve their efficiency via parallelization.
+
+## Exact Algorithms for MCOP
+
+### Brute-Force Algorithm
+
+In this first algorithm we will consider all possible unique orderings for a given sequence of matrix products, directly compare the amount of operations needed for each one and select the one which minimizes the number of operations needed.
+
+Clearly, this is the least efficient way of approaching MCOP, but it is interesting to consider it as an exemplification.
+
+To be able to perform this task, we first need to construct two auxiliary functions: one which calculates all possible parenthesizations uniquely via the vector notation introduced in Task 3 and another one which, given a parenthesization and the list of matrices, returns the amount of operations required to perform it.
+
+-   To tackle the **unique representation for a given parenthesization**, notice that there are $(n-1)!$ permutations of $(1,2,\dots,n-1)$ and several of them refer to the same parenthesization, as exemplified before. Clearly, one could blindfoldedly try to analyze the whole $(n-1)!$ permutations, but this task is computationally untractable as $n$ grows.
+
+In contrast, working with the unique $C_{n-1}$ orderings, amount for $C_{n-1}\approx \frac{4^{n-1}}{(n-1)^{3/2}\sqrt{\pi}}< 4^{n-1}$ possibilities. This still amounts for an exponential number of situations, but notably less than $(n-1)!$.
+
+The algorithm for computing these $C_{n-1}$ orderings follows a straightforward approach: for each split considered, the priority is given to the left subproblem after parenthesization. Since performing first the left subproblem's splits or the right ones is irrelevant for the final parenthesization, imposing to perform first the left one ensures uniqueness in the representation.
+
+Next, the split is marked as the last operation to be executed locally, and the process is traced backwards recursively.
+
+If the first split is at position $k$, meaning the expression is divided as $(A_i \dots A_k)(A_{k+1} \dots A_n)$, then the last multiplication occurs at $k$. By recursively considering all possible splits for $(A_i \dots A_k)$ and $(A_{k+1} \dots A_n)$, appending them in order—first the left splits, then the right—we ensure a unique representation.
+
+The pseudocode for this recursive algorithm follows:
+
+```         
+Input: The length `n` of the matrix product
+
+1. If n=1 return an empty list
+2. Initialize `orders` an empty list
+3. For all possible splits K = 1,\dots, n-1:
+
+    1. Recursive call for the left subproblem of $k$ matrices
+    2. Recursive call for teh right subproblem of $n-k$ matrices
+    3. For each element in the left subproblem's list and for each element in 
+    the right one,append them to `orders` as a new vector, including first the 
+    left ordering, then the right one and finally k.
+```
+
+```{r Unique orders}
+# unique_orders_R
+# 
+# Auxiliary function which recursively computes all unique parenthesizations for
+# a product of n matrices
+# 
+# **Input Parameters:**
+# 1. **n**:
+#    Integer indicating the number of matrices to multiply
+# 
+# **Output:**
+# Returns a list with vectors indicating the representations of each unique order
+# 
+unique_orders_R <- function(n) {
+  
+  # Minimal case
+  if (n == 1) {
+    return(list(NULL))
+  }
+  
+  # Initalize the resulting list of orderings
+  orders <- list()
+  
+  # Iterate over all possible splits
+  for (k in 1:(n - 1)) {
+    # Obtain all possible orders of the left-part of the split (k matrices)
+    left_orders <- unique_orders_R(k)
+    
+    # Obtain all possible orders of the right-part of the split (n-k matrices)
+    right_orders <- unique_orders_R(n - k)
+    
+    # Join together the orders, performing first the left part
+    for (i in left_orders) {
+      for (j in right_orders) {
+        # Combine the split at the left and at the right and store them
+        # Notice that the splits at the right are indexed + k.
+        orders <- c(orders, list(c(i, j + k, k)))
+      }
+    }
+  }
+  
+  # Return the list with all possible orders
+  return(orders)
+}
+```
+
+-   The second auxiliary function tackles **computing the operations needed** to perform a given parenthesization.
+
+Its pseudocode follows:
+
+```         
+Input: `order` a given parenthesization and `matrix_list`
+
+1. Obtain the number $n$ of matrices and their dimensions $dims$ in which we 
+note that the columns of a matrix coincide with the rows of the subsequent one.
+2. Initalize a boolean vector `avail` = (1,...,1) which indicates availability 
+for multiplication
+3. Initialize `total_ops` = 0 the total number of operations
+4. Iterate over the elements of `order`:
+  
+    1. Find available matrices via the indexes `avail` = 1
+    2. Obtain the rightmost available matrix to the left of the current product 
+    and the first one to teh right
+    3. Calculate the number of operations needed to perform the product via 
+    `dims` and add it to $total_ops`
+    4. Indicate `avail` = 0 to the right matrix
+    5. Update the dimensions of the left matrix: inherits the number of columns of the right matrix
+    
+5. When this loop is completed, we have obtained the optimal order
+```
+
+```{r Operations}
+# operations_R
+# 
+# Auxiliary function which calculates teh operations needed to perform a given
+# peranthesization
+# 
+# **Input Parameters:**
+# 1. **order**:
+#    Integer vector indicating the parenthesization to perform
+# 
+# 2. **matrix_list**:
+#    List with matrices to be multiplied
+# 
+# **Output:**
+# Returns the number of operations needed to perform the given parenthesization
+# 
+operations_R= function(order, matrix_list){
+  
+  # Nº of matrices
+  n <- length(matrix_list)
+  
+  # Extract matrix dimensions
+  dims <- vector('integer', n + 1)
+  for (i in seq_along(matrix_list)) {
+    if (i == 1) {
+      # At first iteration, obtain the nº of rows and columns of the matrix
+      dims[1:2] <- dim(matrix_list[[1]])
+    } else {
+      # After, retain only the nº of columns
+      dims[i + 1] <- dim(matrix_list[[i]])[2]
+    }
+  }
+  
+  # Initialize availability vector
+  avail <- rep(1, n + 1)  
+  
+  # Initialize total operations
+  total_ops <- 0
+  
+  # Iterate through each product
+  for (i in order) {
+    # Find the available indexes
+    indexes <- which(avail == 1)
+    
+    # Rightmost available matrix to the left of i
+    left_indexes <- which(indexes <= i + 1)
+    idx_left <- left_indexes[length(left_indexes)]
+    mat_left <- indexes[idx_left]
+    
+    # Index of the matrix at the right
+    mat_right <- i + 2
+  
+    # Compute the number of operations for this multiplication and accumulate
+    total_ops <- total_ops + 
+      dims[indexes[idx_left - 1]] * dims[mat_left] * dims[mat_right]
+    
+    # Update dimensions to account for the product
+    dims[mat_left] <- dims[mat_right]
+    
+    # Mark the right matrix as unavailable
+    avail[mat_right] <- 0
+  }
+  
+  return(total_ops)
+}
+```
+
+Having introduced these two functions, let's check their implementation by recreating the table capturing all possible parenthesizations and the number of operations needed for each one for the original example.
+
+```{r Unique orders and operations}
+# List of matrices considered
+mat_list = list(A, B, C, D, E)
+
+# Unique orders
+orders <- unique_orders_R(length(mat_list))
+
+# Operations required for each order
+operations <- unlist(lapply(orders,
+                            function(order) operations_R(order, mat_list)))
+
+# Convert vectors to character strings
+orders <- sapply(orders, function(v) paste('(',paste(v, collapse = ","), ')'))
+
+# Create a dataframe
+df <- data.frame(Orders = orders, Operations = operations)
+
+# Display the styled table
+kable(df, caption = "Unique orders and operations", align = "l", 
+      format = "markdown")
+```
+
+Now, the final **brute-force algorithm** is straightforward:
+
+```         
+Input: `matrix_list` list with matrices to multiply
+
+1. Obtain the unique orderings for the given product size
+2. Initialize a `opt_order` and `opt_operations` variables to retain the optimal
+order and its operations
+3. Iterate over all possible orders:
+
+  1. Compute the necessary operations `temp_operations` to perform the 
+  perenthesization
+  2. If `temp_operations` < `opt_operations`, update `opt_order` and 
+  `opt_operations` with the present
+```
+
+```{r Burte Force Algorithm}
+# Brute_R
+# 
+# Brute-force algorithm which, given a list of matrices, computes, by comparing 
+# all possible orders, the optimal parenthesization
+# 
+# **Input Parameters:**
+# 1. **matrix_list**:
+#    List with matrices to be multiplied
+# 
+# **Output:**
+# Returns the vector with the best parenthesization
+# 
+Brute_R = function(matrix_list){
+
+  # Nº of matrices
+  n = length(matrix_list)
+  
+  # Obtain the nº of unique orders
+  orders = unique_orders_R(n)
+  
+  for (i in seq_along(orders)){
+    if (i == 1){
+      # Initialize the best order and operations
+      opt_order = orders[[1]]
+      opt_operations = operations_R(opt_order, matrix_list)
+    } else{
+      # Actual order and operations
+      temp_order = orders[[i]]
+      temp_operations = operations_R(temp_order, matrix_list)
+      
+      # Update if better order
+      if (temp_operations < opt_operations){
+        opt_order = temp_order
+        opt_operations = temp_operations
+      }  
+    }
+  }
+
+  # Return the optimal order of the matrices
+  return(opt_order)
+}
+```
+
+Let's check that the algorithm outputs the optimal arrangement:
+
+```{r Check Brute}
+# Original product
+mat_list = list(A, B, C, D, E)
+
+# Dynamic algorithm
+Brute_R(matrix_list = mat_list)
+```
+
+For this algorithm, since it is a priori non-efficient, we will omit its `Rcpp` implementation, since its comparison renders unimportant.
+
+Notice that `unique_orders_R` has a complexity of $O(4^{n}/n^{3/2})$, `operations_R` has $O(n)$ and finally comparing all orders $O(4^{n}/n^{3/2})$, the overall asymtotic complexity of this algorithm would be $O(4^{n}/n^{3/2} + 4^{n}/n^{3/2} \cdot n + 4^{n}/n^{3/2}) = O(4^{n}/n^{1/2})$, which is exponential.
+
+------------------------------------------------------------------------
+
+### Dynamic Algorithm
+
+A more intelligent approach to identify the optimal product ordering lies behind a fairly simple logic: The optimal ordering of a set on $n$ matrices $\left\{A_1,\dots,A_n \right\}$, with respective sizes $d_0,d_1,d_2,\dots,d_{n}$, can be obtained by comparing all possible splits $(A_1,\dots,A_k)(A_{k+1},\dots,A_n)$. Logically, the optimal split in this fashion would 'imply' to perform both $(A_1,\dots,A_k)$ and $(A_{k+1},\dots,A_n)$ optimally. That logic is recursively applied and made bottom-up to finally attain in a much more efficient than the brute-force approach the optimal prenthesization.
+
+> Notice dimensional arrangements for multiplication: $(A_{1})_{d_0\times d_1}, (A_2)_{d_1\times d_2}, \dots, (A_n)_{d_{n-1}\times d_n}$.
+
+Formally, let's note $M(i,j)$ the least number of operations needed to perform $(A_i\dots A_j)$ and $S(i,j)$ the best split which accounts for $M(i,j)$ for $i<j,\,i,j \in \{1,\dots,n\}$.
+
+Then, the aim of the algorithm is to find $M(1,n)$ and the set of splits accounting for this minimum.
+
+Clearly $M(i,i) = 0\;\forall i$, since we are not performing any multiplication but rather 'starting' the algorithm at that given matrix. For $M(i,i+1) = d_{i-1}\cdot d_i\cdot d_{i+1}$, the value of fixed, since we just have one possible ordering: direct multiplication.
+
+Nonetheless - and here is where the intelligent part of the idea comes in- for any $i<j$ we have that $M(i,j)$ can be attained if we compare the cost of all the possible splits of the product $(A_i\dots A_j)$. That is, check, for every $i<k<j$ the optimal way of performing $\left(A_i,\dots,A_k \right) \left(A_{k+1},\dots,A_j \right)$, which would be given by $$ M(i,k) + d_{i-1}\,d_k\,d_j  + M(k+1,j),$$ where $M(i,k)$ and $M(k+1,j)$ stand for the most efficient ways to perform $\left(A_i,\dots,A_k \right) \left(A_{k+1},\dots,A_j \right)$ respectively and $d_{i-1}\,d_k\,d_j$ the computational operations needed to make the corresponding product.
+
+As such, we have that $$ M(i,j) = \min_{i<k<j}M(i,k) + d_{i-1}\,d_k\,d_j  + M(k+1,j).$$
+
+If we were to store all $M(i,j)$ in an upper triangular matrix , then we'd have to work our way the main diagonal up, as shown in the present picture:
+
+<center>
+
+![](images/clipboard-3571546663.png)
+
+*Figure 1: Illustration of the Dynamic algorithm. Ref: [andreas-klappenecker](https://people.engr.tamu.edu/andreas-klappenecker/csce629-f17/csce411-set6c.pdf)*
+
+</center>
+
+Once computed this matrix, to obtain the optimal number of operations for each multiplication problem subset, we must keep, for every step $M(i,j)$, the value $k$ which accounts for the optimal split (to be stored in another matrix $S$).
+
+Then, the algorithm has a final step, called *traceback* in which, having computed $S$, we *trace back* the splits which make the optimal number of operations possible. For it, we identify the split $k = S(1,n)$, properly store it and then study $S(1,k), S(k+1,n)$ iteratively down until completing the whole traceback.
+
+The pseudocode for the algorithm would be:
+
+```         
+Input: mat_list = {A_1,...,A_n}$
+
+1.  Obtain the dimensions d_0,\dots,d_n.
+2.  For i = 1,...,n make M(i,i) = 0
+3.  For l = 1,..., n-1, accounts for the l-th diagonal 
+
+  1. For i = 1,..., n-l, entry in the diagonal (row index)
+  
+    1.  Make j = 1 + l the associated column index
+    2.  Initialize M(i,j) as a sufficiently large value
+    3.  For k = 1,..., j-1 split
+    4.  Compute \hat{M}(i,j) = M(i,k) + d_{i-1}\,d_k\,d_j  + M(k+1,j).
+    5.  If \hat{M}(i,j) < M(i,j), then update M(i,j) = \hat{M}(i,j) and S(i,j)=k
+    6.  When this loop is completed, we have found exactly M(i,j).
+    
+  2.  When this loop is completed, we have obtained all M's in the $l$-th diagonal
+  
+4.  When this loop is completed, we have obtained the full matrices M and S
+```
+
+As for the *traceback*, we can implement it via a recursive algorithm:
+
+```         
+Input: Matrix S, index i, index j:
+
+1.  If i = j return an empty vector
+
+2.  Else: Obtain the split k = S(i,j) and recursively obtain 
+`left_order` = traceback(S, i, k), `right_order` = traceback(S, k + 1, j)
+
+3.  Concatenate (`left_order`, `right_order`, k), since we have to perform the left and right multiplications first
+```
+
+All in all, the first part of the algorithm (Calcualting $M$ and $S$) has a computational complexity of $\mathcal{O}(n^3)$, where $n$ is the number of matrices to multiply, and the traceback $\mathcal{O}(n)$, so its overall complexity would be $\mathcal{O}(n^3 + n) = \mathcal{O}(n^3)$.
+
+A direct implementation of the dynamic programming algorithm for matrix multiplication in R follows:
+
+```{r Dynamic_Ordering_R}
+# Dynamic_Ordering_R
+# 
+# Dynamic algorithm which, given a list of matrices, computes dynamically the
+# optimal parenthesization to perform the multiplication
+# 
+# **Input Parameters:**
+# 1. **matrix_list**:
+#    List with matrices to be multiplied
+# 
+# **Output:**
+# Returns the vector with the best parenthesization
+# 
+Dynamic_Ordering_R = function(matrix_list){
+  
+  # Obtain the size of the list
+  n <- length(matrix_list)
+  
+  # Obtain the size of each matrix in the list 
+  # (Index is +1 to the notation used in d_i)
+  dimensions <- vector('integer', n + 1)
+  for (i in seq_along(matrix_list)){
+    if (i == 1){
+      # At first iteration, obtain the nº of rows and columns of the matrix
+      dimensions[1:2] = dim(matrix_list[[1]])
+    } else {
+      # After, retain only the nº of columns
+      dimensions[i+1] = dim(matrix_list[[i]])[2]
+    }
+  }
+  
+  # Initialize M and S
+  M = matrix(0, n, n)
+  S = matrix(0, n, n)
+  
+  # Iterate over the diagonals
+  for (l in 1:(n-1)){ 
+    # Iterate over the elements of the diagonal
+    for (i in 1:(n-l)){
+      j = i + l
+      
+      # Initialze a temporal value for M(i,j)
+      M[i,j] = Inf 
+   
+      # Iterate over all possible splits
+      for (k in i:(j-1)){
+        # Minimal operations for the k-th split
+        temp = M[i,k] + dimensions[i]*dimensions[k+1]*dimensions[j+1] + M[k+1,j]
+        
+        # Update check for the optimal nº of operations and split
+        if (M[i,j] > temp){
+          M[i,j] = temp
+          S[i,j] = k
+        }
+      }
+    }
+  }
+
+  # Traceback algorithm (Implemented inside the function)
+  traceback_order <- function(S, i, j) {
+    if (i == j) {
+      return(NULL)                                # No multiplication needed
+    } else {
+      k <- S[i, j]                                # Optimal split point
+      left_order <- traceback_order(S, i, k)      # Left subproblem traceback
+      right_order <- traceback_order(S, k + 1, j) # Right subproblem traceback
+      return(c(left_order, right_order, k))       # Combine the results
+    }
+  }
+  
+  # Obtain the matrix multiplication order given by S
+  ord <- traceback_order(S, 1, n)
+  
+  # Return the optimal order
+  return(ord)
+}
+```
+
+Let's check that the algorithm outputs the desired order:
+
+```{r Check Dynamic}
+# Original product
+mat_list = list(A, B, C, D, E)
+
+# Dynamic algorithm
+Dynamic_Ordering_R(matrix_list = mat_list)
+```
+
+One of the benefits of this algorithm is that, when computing all $M(i,j)$'s in a fixed diagonal, the task can be parallelized, since the computations for a given element of the diagonal are independent from the other ones. This would, in theory, boost the algorithm's efficiency. In `R`, this can easily be achieved via the `parallel` package and, in particular, the `par.apply` frontend which seamlessly works as the `lapply` function.
+
+Notice that we have changed the algorithm a bit: To efficiently perform parallelization via a new function `proc_diag_el` which is the one to parallelize, we made certain **cacheing** to minimize the cost of memory accesses. That is, rather than inputting the whole matrix $M$, we just included the portions of $M$ (rows and columns) of interest.
+
+```{r Dynamic_Ordering_R_Parallel}
+# Dynamic_Ordering_R_Parallel
+# 
+# Dynamic algorithm which, given a list of matrices, computes dynamically the
+# optimal parenthesization to perform the multiplication. The algorithm does 
+# parallelization when processing diagonals.
+# 
+# **Input Parameters:**
+# 1. **matrix_list**:
+#    List with matrices to be multiplied
+# 
+# **Output:**
+# Returns the vector with the best parenthesization
+# 
+Dynamic_Ordering_R_Parallel = function(matrix_list, cl){
+  
+  # Obtain the size of the list
+  n <- length(matrix_list)
+  
+  # Obtain the size of each matrix in the list 
+  # (Index is +1 to the notation used in d_i)
+  dimensions <- vector('integer', n + 1)
+  for (i in seq_along(matrix_list)){
+    if (i == 1){
+      # At first iteration, obtain the nº of rows and columns of the matrix
+      dimensions[1:2] = dim(matrix_list[[1]])
+    } else {
+      # After, retain only the nº of columns
+      dimensions[i+1] = dim(matrix_list[[i]])[2]
+    }
+  }
+  
+  # Initialize M and S
+  M = matrix(0, n, n)
+  S = matrix(0, n, n)
+  
+  # Function used to parallelize the processing of the elements in a given 
+  # diagonal of M
+  proc_diag_el = function(ll){
+    # Obtain the elements in ll
+    i = ll$i
+    j = ll$j
+    dimensions = ll$dimensions
+    M_row = ll$M_row
+    M_col = ll$M_col
+      
+    # Initialze a temporal value for M(i,j) and S(i,j)
+    Mij = Inf 
+    Sij = NA
+  
+    # Iterate over all possible splits
+    for (k in i:(j-1)){
+      # Minimal operations for the k-th split
+      temp = M_row[k-i+1] + 
+        dimensions[i]*dimensions[k+1]*dimensions[j+1] + M_col[k-i+1]
+      
+      # Update check for the optimal nº of operations and split
+      if (Mij > temp){
+        Mij = temp
+        Sij = k
+      }
+    }
+    
+    # Return a list with the necessary elements
+    return(list(i = i,       # Row
+                j = j,       # Column
+                Mij = Mij,   # Minimal number of operations
+                Sij = Sij    # Best split
+                ))
+  }
+  
+  
+  # Iterate over the diagonals
+  for (l in 1:(n-1)){ 
+    # Create a list containing several lists with elements 
+    # (i, j, dimensions and the elements of M of interest) for i = 1:n-l which 
+    # characterize the elements of the l-th diagonal
+    diag_el = lapply(1:(n-l), function(i) list(i = i, j = i + l, 
+                                               dimensions = dimensions, 
+                                               M_row = M[i, 1:(i+l-1)],
+                                               M_col = M[(i+1):(i+l), i+l]))
+    
+    # Perform `proc_diag_el` in parallel
+    diagonal = parLapply(cl, diag_el, proc_diag_el)
+    
+    # Update M and S
+    for (ll in diagonal){
+      i = ll$i; j = ll$j                # Indexes
+      M[i,j] = ll$Mij; S[i,j] = ll$Sij  # Optimal multiplications and split
+    }
+  }
+
+  # Traceback algorithm (Implemented inside the function)
+  traceback_order <- function(S, i, j) {
+    if (i == j) {
+      return(NULL)                                # No multiplication needed
+    } else {
+      k <- S[i, j]                                # Optimal split point
+      left_order <- traceback_order(S, i, k)      # Left subproblem traceback
+      right_order <- traceback_order(S, k + 1, j) # Right subproblem traceback
+      return(c(left_order, right_order, k))       # Combine the results in a vector
+    }
+  }
+  
+  # Obtain the matrix multiplication order given by S
+  ord <- traceback_order(S, 1, n)
+  
+  # Return the optimal order
+  return(ord)
+}
+```
+
+```{r Check Dynamic_Parallel}
+# Original product
+mat_list = list(A, B, C, D, E)
+
+# Initialize the cluster for parallelization
+cl <- makeCluster(detectCores() - 1)  # All cores but 1
+
+# Dynamic algorithm
+Dynamic_Ordering_R_Parallel(matrix_list = mat_list, cl)
+
+# Close parallelization
+stopCluster(cl)
+```
+
+A direct implementation of the dynamic programming algorithm for matrix multiplication in Rcpp follows. Notice that we will implement the **traceback** algorithm separately.
+
+```{Rcpp Dynamic_Ordering_Rcpp}
+// traceback_order
+//
+// Function which performs traceback from a dynamic algorithm's best split 
+// matrix output
+//
+// **Input Parameters:**
+// 1. **S**:  
+//    Matrix containing the best split for each possible multiplication subset
+//
+// 2. **i,j**:  
+//    Integers indicating i the first matrix in the subset product and j the last
+//
+// **Output:**
+// Returns a vector with the optimal parenthesization for (Ai...Aj)
+//
+#include <RcppArmadillo.h> 
+// [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::export]]
+arma::uvec traceback_order(arma::imat S, int i, int j){
+  if (i == j){
+    return arma::uvec(); // No multiplication needed
+  } else{
+    int k = S(i,j) - 1;  // Optimal split point (Index in C++)
+
+    arma::uvec left_order = traceback_order(S, i, k);     // Left traceback
+    arma::uvec right_order = traceback_order(S, k+1, j);  // Right traceback
+
+
+    // Combine the results in a vector
+    arma::uvec result = arma::join_cols(arma::join_cols(left_order, right_order),
+                                        arma::uvec({static_cast<unsigned int>(k)}));
+    return result;
+  }
+}
+
+// Dynamic_Ordering_Rcpp
+//
+// Dynamic algorithm which, given a list of matrices, computes dynamically the
+// optimal parenthesization to perform the multiplication
+//
+// **Input Parameters:**
+// 1. **matrix_list**:
+//    List with matrices to be multiplied
+//
+// **Output:**
+// Returns the vector with the best parenthesization
+// 
+#include <RcppArmadillo.h> 
+// [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::export]]
+arma::uvec Dynamic_Ordering_Rcpp(Rcpp::List matrix_list){
+  
+  // Obtain the size of the list
+  int n = matrix_list.size();
+
+  // Obtain the size of each matrix in the list
+  arma::uvec dimensions(n + 1, arma::fill::zeros);
+  for (int i = 0; i < n; i++){
+    arma::imat mat = matrix_list[i];
+    if (i == 0){
+      // At first iteration, obtain the nº of rows and columns of the matrix
+      dimensions[0] = mat.n_rows;
+      dimensions[1] = mat.n_cols;
+    } else{
+      // Retain only the nº of columns
+      dimensions[i + 1] = mat.n_cols;
+    }
+
+  }
+
+  // Initialize M and S
+  arma::mat M(n, n, arma::fill::zeros); 
+  arma::imat S(n, n, arma::fill::zeros);
+
+
+  // Iterate over the diagonals
+  for (int l = 1; l < n; l++){
+    // Iterate over the elements of the diagonal
+    for (int i = 0; i < n-l; i++){
+      int j = i + l;
+      
+      // Initialize a temporal value for M(i,j)
+      M(i,j) = arma::datum::inf;
+
+      // Iterate over all possible splits
+      for (int k = i; k < j; k++){
+        // Minimal operations for the k-th split
+        int temp = M(i,k) + 
+                   dimensions[i]*dimensions[k+1]*dimensions[j+1] + M(k+1,j);
+
+
+        // Update check for the optimal nº of operations and split
+        if (M(i,j) > temp){
+          M(i,j) = temp;
+          S(i,j) = k + 1;
+        }
+      }
+      
+    }
+  }
+
+  // Obtain the matrix multiplication order given by S
+  arma::uvec ord = traceback_order(S, 0, n-1) + 1; 
+  
+  // Return the results as a list
+  return ord;
+}
+```
+
+Check for correctness:
+
+```{r Check Dynamic Rcpp}
+# Original product
+mat_list = list(A, B, C, D, E)
+
+# Algorithm
+as.vector(Dynamic_Ordering_Rcpp(matrix_list = mat_list))
+```
+
+As before, we will parallelize this function via `RcppParallel`, which, although more difficult to implement, gives us more flexibility in parallelization tasks (explicit parallelization). Note that in `C++` parallelization happens at a thread-level, rather than at a process-level in `R`, which would make the parallelization benefits much more noticeable.
+
+A parallelized implementation of the dynamic programming algorithm for matrix multiplication in Rcpp follows:
+
+```{Rcpp Dynamic_Ordering_Rcpp_Parallel}
+// traceback_order
+//
+// Function which performs traceback from a dynamic algorithm's best split 
+// matrix output
+//
+// **Input Parameters:**
+// 1. **S**:  
+//    Matrix containing the best split for each possible multiplication subset
+//
+// 2. **i,j**:  
+//    Integers indicating i the first matrix in the subset product and j the last
+//
+// **Output:**
+// Returns a vector with the optimal parenthesization for (Ai...Aj)
+//
+#include <RcppArmadillo.h> 
+// [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::export]]
+arma::uvec traceback_order(arma::imat S, int i, int j){
+  if (i == j){
+    return arma::uvec(); // No multiplication needed
+  } else{
+    int k = S(i,j) - 1;  // Optimal split point (Index in C++)
+
+    arma::uvec left_order = traceback_order(S, i, k);     // Left traceback
+    arma::uvec right_order = traceback_order(S, k+1, j);  // Right traceback
+
+    // Combine the results in a vector
+    arma::uvec result = arma::join_cols(arma::join_cols(left_order, right_order),
+                                        arma::uvec({static_cast<unsigned int>(k)}));
+    return result;
+  }
+}
+
+
+// diagonal_worker
+//
+// RcppParallel worker which performs the diagonal loop to be parallelized
+//
+// **Input Parameters:**
+// 1. **dimensions**:
+//    Vector which stores the dimensions of the matrix list
+//
+// 2. **M**: 
+//    Minimum operations matrix in the dynamic algorithm
+//
+// 3. **S**:
+//    Best split matrix in the dynamic algorithm
+//
+// 4. **l**:
+//    Integer indicating the diagonal
+//
+// 
+// [[Rcpp::depends(RcppArmadillo, RcppParallel)]]
+#include <RcppParallel.h> 
+struct diagonal_worker : public RcppParallel::Worker {
+  // Member variables
+  const arma::uvec& dimensions;  // Matrix dimensions
+  arma::mat& M;                  // Matrix M of minimal operations
+  arma::imat& S;                 // Matrix S of optimal split
+  int l;                         // Integer indicating the diagonal
+
+  // Initialize the worker and pass the variables' info.
+  diagonal_worker(const arma::uvec& dimensions, arma::mat& M, 
+                arma::imat& S, int l)
+    : dimensions(dimensions), M(M), S(S), l(l) {}
+
+  // Loop to be parallelized: Operations in each element of the diagonal.
+  // As input, receives elements in range i:end
+  void operator()(std::size_t i, std::size_t end) {
+    for (; i < end; i++) {
+      // Coordinates of the diagonal element
+      int j = i + l;
+
+      // Initialize a temporal value for M(i,j)
+      M(i, j) = arma::datum::inf;
+      
+      // Non-parallelizable for: Iterate over all possible splits
+      for (int k = i; k < j; k++) {
+        // Minimal operations for the k-th split
+        int temp = M(i, k) + 
+                   dimensions[i] * dimensions[k + 1] * dimensions[j + 1] + M(k + 1, j);
+
+        // Update check for the optimal nº of operations and split
+        if (M(i, j) > temp) {
+          M(i, j) = temp;
+          S(i, j) = k + 1;
+        }
+      }
+    }
+  }
+};
+
+
+// Dynamic_Ordering_Rcpp_Parallel
+//
+// Dynamic algorithm which, given a list of matrices, computes dynamically the
+// optimal parenthesization to perform the multiplication. The algorithm does 
+// parallelization when processing diagonals.
+//
+// **Input Parameters:**
+// 1. **matrix_list**:
+//    List with matrices to be multiplied
+//
+// **Output:**
+// Returns the vector with the best parenthesization
+// 
+#include <RcppArmadillo.h> 
+// [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::export]]
+arma::uvec Dynamic_Ordering_Rcpp_Parallel(Rcpp::List matrix_list){
+  
+  // Obtain the size of the list
+  int n = matrix_list.size();
+
+  // Obtain the size of each matrix in the list
+  arma::uvec dimensions(n + 1, arma::fill::zeros);
+  for (int i = 0; i < n; i++){
+    arma::imat mat = matrix_list[i];
+    if (i == 0){
+      // At first iteration, obtain the nº of rows and columns of the matrix
+      dimensions[0] = mat.n_rows;
+      dimensions[1] = mat.n_cols;
+    } else{
+      // Retain only the nº of columns
+      dimensions[i + 1] = mat.n_cols;
+    }
+
+  }
+
+  // Initialize M and S
+  arma::mat M(n, n, arma::fill::zeros); 
+  arma::imat S(n, n, arma::fill::zeros);
+
+
+  // Iterate over the diagonals
+  for (int l = 1; l < n; l++){
+    diagonal_worker worker(dimensions, M, S, l);
+    parallelFor(0, n - l, worker);
+  }
+
+  // Obtain the matrix multiplication order given by S
+  arma::uvec ord = traceback_order(S, 0, n-1) + 1; 
+  
+  // Return the results as a list
+  return ord;
+}
+```
+
+Check for correctness:
+
+```{r Check Dynamic Rcpp Parallel}
+# Original product
+mat_list = list(A, B, C, D, E)
+
+# Algorithm
+as.vector(Dynamic_Ordering_Rcpp_Parallel(matrix_list = mat_list))
+```
+
+Now, let's compare all four versions of the Dynamic algorithm implemented and the brute-force approach via a benchmark:
+
+```{r Dynamic Benchmark}
+# Original product
+mat_list = list(A, B, C, D, E)
+
+# Initialize the cluster for parallelization
+cl <- makeCluster(detectCores() - 1)  # All cores but one
+
+# Benchmark the four methods considered
+results = benchmark(
+  Brute_R(matrix_list = mat_list),
+  Dynamic_Ordering_R(matrix_list = mat_list),
+  Dynamic_Ordering_R_Parallel(matrix_list = mat_list, cl = cl),
+  Dynamic_Ordering_Rcpp(matrix_list = mat_list),
+  Dynamic_Ordering_Rcpp_Parallel(matrix_list = mat_list),
+  replications = 1000,
+  columns = c("test", "elapsed", "relative", "replications"),
+  order = "relative"
+)
+
+# Close parallelization
+stopCluster(cl)
+
+# Format the results
+results$test = c('Dynamic R', 'Dynamic Rcpp', 'Dynamic Rcpp Parallel', 
+                 'Brute R' ,'Dynamic R Parallel')
+row.names(results) = NULL
+
+# Display the styled table
+kable(results, caption = "Dynamic Algorithm comparison", align = "l", 
+      format = "markdown")
+```
+
+We notice the following:
+
+-   `Dynamic_Ordering_R` and `Dynamic_Ordering_Rcpp` are performance-tied: the computational benefits of `Rcpp` aren't noticeable in this example. Note that the present example is a fairly small problem, and the elapsed time required by these algorithms is barely measurable.
+-   `Dynamic_Ordering_Rcpp_Parallel` and `Dynamic_Ordering_R_Parallel` both perform worse than their non-parallel counterparts. This is potentially due to the overhead required to set up the parallelization, which is more costly than the benefits it provides. Particularly, the overhead in the `Rcpp` implementation is notably lower than that of `R`: `Dynamic_Ordering_Rcpp` is 5.5 times slower than `Dynamic_Ordering_Rcpp`, but `Dynamic_Ordering_R` is 86 times slower than `Dynamic_Ordering_R`. This difference may also be due to the increased efficiency thread-parallelization proved with respect to process-parallelization.
+-   It is significant, as well, that `Brute_R` wasn't the worst-performing algorithm. It performed worse than all standard Dynamic algorithms and than `Dynamic_Ordering_Rcpp_Parallel`. This supports our previous argument: parallelization in base `R` is far from worth it.
+
+It's interesting to consider the same benchmark for a larger problem. Let's consider a sixth matrix $F_{50\times 500}$ ad make the chain three times: $$ABCDEF\cdot ABCDEF\cdot ABCDEF$$
+
+```{r Dynamic Benchmark2}
+# New product
+F <-  matrix(runif(50*500), nrow = 50, ncol = 500)
+mat_list = list(A, B, C, D, E, F, A, B, C, D, E, F, A, B, C, D, E, F)
+
+# Initialize the cluster for parallelization
+cl <- makeCluster(4)  # 4 cores is the least number of cores in actual computers
+
+# Benchmark the four methods considered
+results = benchmark(
+  Dynamic_Ordering_R(matrix_list = mat_list),
+  Dynamic_Ordering_R_Parallel(matrix_list = mat_list, cl = cl),
+  Dynamic_Ordering_Rcpp(matrix_list = mat_list),
+  Dynamic_Ordering_Rcpp_Parallel(matrix_list = mat_list),
+  replications = 100,
+  columns = c("test", "elapsed", "relative", "replications"),
+  order = "relative"
+)
+
+# Close parallelization
+stopCluster(cl)
+
+# Format the results
+results$test = c('Dynamic Rcpp', 'Dynamic R', 'Dynamic Rcpp Parallel', 
+                 'Dynamic R Parallel')
+row.names(results) = NULL
+
+# Display the styled table
+kable(results, caption = "Dynamic Algorithm comparison", align = "l", 
+      format = "markdown")
+```
+
+This time we observe the following:
+
+-   `Dynamic_Ordering_Rcpp` stands out as the most efficient efficient algorithm, closely followed by `Dynamic_Ordering_R`. As such, we can observe that, as well for larger problems, the benefits from `Rcpp` merely stand out.
+-   The overhead for parallelization is still present: `Dynamic_Ordering_Rcpp_Parallel` is still less efficient than both `Dynamic_Ordering_Rcpp` and `Dynamic_Ordering_R`, but the difference between the overhead for `Dynamic_Ordering_Rcpp_Parallel` and `Dynamic_Ordering_R_Parallel` is much more noticeable: while the former is still around 5 times slower than its non-parallel counterpart, the `Dynamic_Ordering_R_Parallel` spikes to above $4000\%$ increase in computation time.
+
+## Approximate algorithms for MCOP
+
+In this section we will consider a different approach to matrix multiplication ordering: **Greedy Algorithms**. Rather than obtaining an optimal parenthesization, the algorithms to be presented aim at obtaining a sufficiently-good parenthesization, taking locally-optimal decisions which globally don't necessarily account for the best parenthesization.
+
+Particularly, these algorithms are thought to be practical: simple ideas and very low computational cost so as to, when performing a chain matrix multiplication, their overhead is much lower than the benefit they provide.
+
+#### Greedy Algorithm 1
+
+This first implementation uses an extremely simple idea: recall that, when multiplying $A_{a\times b}, B_{b\times c}$, the cost is $a\cdot b\cdot c$ and the resulting matrix is $(AB)_{a\times c}$. As such, any possible further matrix multiplication having done $(AB)$ won't take into account the 'in-between' size $b$.
+
+As such, if we select, from the concordant dimensions of the matrix product to perform first those with biggest dimensions, we are **potentially minimizing the presence of the larger dimensions in the total computation formula** for the parenthesization.
+
+Sorting a vector of fixed dimensions has a computational complexity of $O(n\log n)$, which is much, much faster than the previous exact algorithms.
+
+The pseudocode for this algorithm follows:
+
+```         
+Input: `mat_list` list of matrices to multiply
+
+1. Obtain the concordant dimensions for the inner product of the matrix chain
+2. Sort them in descending order
+3. The order will be the indexes corresponding to the sorting
+```
+
+```{r Greedy1 R}
+# greedy1_R
+# 
+# Greedy algorithm for matrix multiplication which prioritizes the products
+# with bigger inner-dimensions and returns an approximation to the optimal order
+# 
+# **Input Parameters:**
+# 1. **matrix_list**:
+#    List with matrices to be multiplied
+# 
+# **Output:**
+# A vector indicating the approximation to the optimal order
+greedy1_R = function(matrix_list){
+  
+  # Obtain the size of the list
+  n <- length(matrix_list)
+  
+  # Obtain the size of each inner matrix in the list (column-wise)
+  dims <- vector('integer', n - 1)
+  for (i in 1:(n-1)){
+    dims[i] = dim(matrix_list[[i]])[2]
+  }
+
+  # Return the order given
+  return(order(dims, decreasing = TRUE))
+}
+```
+
+Let's check if the resulting order is the optimal one and if the algorithm works fine:
+
+```{r Check Greedy1 R}
+# Original problem
+mat_list = list(A, B, C, D, E)
+
+# Greedy algorithm
+greedy1_ord <- greedy1_R(matrix_list = mat_list)
+print(greedy1_ord)
+
+# Operations needed
+operations_R(matrix_list = mat_list, order =  greedy1_ord)
+```
+
+Notice that the ordering $(3,4,1,2)\equiv(1,3,4,2)$, which coincides with the optimal one, although this is not necessarily the case in every situation.
+
+The very same algorithm can be easily implemented in `Rcpp` as follows:
+
+```{Rcpp Greedy 1 Rcpp}
+// greedy1_Rcpp
+//
+// Greedy algorithm for matrix multiplication which prioritizes the products
+// with bigger inner-dimensions and returns an approximation to the optimal order
+//
+// **Input Parameters:**
+// 1. **matrix_list**:
+//    List with matrices to be multiplied
+//
+// **Output:**
+// Returns a vector with approximately optimal order
+// 
+#include <RcppArmadillo.h>
+// [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::export]]
+arma::uvec greedy1_Rcpp(Rcpp::List matrix_list){
+
+
+  // Obtain the size of the list
+  int n = matrix_list.size();
+
+  // Obtain the nº of columns of the first n-1 matrices
+  arma::uvec dims(n - 1, arma::fill::zeros);
+  for (int i = 0; i < n-1; i++){
+    arma::imat mat = matrix_list[i];
+    dims[i] = mat.n_cols;
+  }
+  
+  // Obtain the index order wich orders decreasingly `dims`
+  arma::uvec order = arma::sort_index(dims, "descend");
+
+  // Return the greedy order and sum 1 for R indexing
+  return order + 1;
+}
+```
+
+Let's check if the algorithm works fine:
+
+```{r Check Greedy1 Rcpp}
+# Original problem
+mat_list = list(A, B, C, D, E)
+
+# Greedy algorithm
+greedy1_ord <- as.vector(greedy1_Rcpp(matrix_list = mat_list))
+print(greedy1_ord)
+
+# Operations needed
+operations_R(matrix_list = mat_list, order =  greedy1_ord)
+```
+
+------------------------------------------------------------------------
+
+#### Greedy Algorithm 2
+
+This second approach to efficiently obtaining an adequate parenthesization is, as well, based in a fairly simple idea: Check, for each possible multiplication at each step which **minimizes the operation cost** needed to perform it.
+
+That is, given $A_{a\times b},B_{b\times c}, C_{c\times d}, D_{d\times e}$, perform first the product which is minimal from $\{a\cdot b\cdot c,\, b\cdot c \cdot d,\, c\cdot d\cdot e \}$, then account for the new dimensions of the resulting matrix and repetat this step.
+
+This algorithm is much more technical than the previous greedy approach and is much more memory-intensive, although it is notably cheaper than the exact algorithms.
+
+Its pseudocode follows:
+
+```         
+Input: `mat_list` list of matrices to multiply
+
+1. Compute the dimensions $dim$ of the matrices
+2. Initialize the $order$ vector to store the parenthesization and 
+`avail` = (1,...,1) boolean vector of matrix availability
+3. For i = 1,..., n-1:
+
+    1. Obtain the available indices `avail` = 1
+    2. From the available indices, calculate which is the matrix product which 
+    minizes 
+    `dims[avail_indexes(k-1)]* dims[avail_indexes(k)]* dims[avail_indexes(k+1)]`
+    3. Update the column dimensions of the matrix at position `avail_index(k)`
+    4. Mark the right matrix as used `avail(avail_index(k+1))`
+    
+4. When this algorithm converges, the approximated order is retrieved
+```
+
+```{r Greedy2_R}
+# greedy2_R
+# 
+# Greedy algorithm for matrix multiplication which prioritizes the products which
+# locally minimize the operation neede to perform them
+# 
+# **Input Parameters:**
+# 1. **matrix_list**:
+#    List with matrices to be multiplied
+# 
+# **Output:**
+# A vector indicating the approximation to the optimal order
+greedy2_R <- function(matrix_list) {
+  # Nº of matrices
+  n <- length(matrix_list)
+  
+  # Extract matrix dimensions
+  dims <- vector('integer', n + 1)
+  for (i in seq_along(matrix_list)){
+    if (i == 1){
+      # At first iteration, obtain the nº of rows and columns of the matrix
+      dims[1:2] = dim(matrix_list[[1]])
+    } else {
+      # After, retain only the nº of columns
+      dims[i+1] = dim(matrix_list[[i]])[2]
+    }
+  }
+  
+  # Initialize the multiplication order
+  order <- numeric(n - 1)
+  indices <- 1:n  # Initial indices (Account for right-sided dimensions (columns))
+  avail = rep(1, n+1)
+  
+  for (i in seq_len(n - 1)) {
+    # Obtain available indices
+    temp_idx <- which(avail == 1)
+    
+    # Compute multiplication costs (d0 and dn are left out)
+    m <- length(temp_idx)
+    costs <- sapply(2:(m-1), function(i) dims[temp_idx[i - 1]] * 
+                                      dims[temp_idx[i]] * dims[temp_idx[i + 1]])
+    
+    # Find index of minimum multiplication cost
+    min_idx <- which.min(costs)       # Costs started at index 2
+    idx_left <- temp_idx[min_idx]     # Associated index to the left matrix
+    idx_right <- temp_idx[min_idx +1] # Associated index to the right matrix
+    
+    # Store multiplication order
+    order[i] <- idx_right - 1 
+    
+    # Update dimensions to account for the product
+    dims[idx_left] <- dims[idx_right]
+    
+    # Indicate already used right matrix
+    avail[idx_right] <- 0
+    
+  }
+  
+  return(order)
+}
+```
+
+Let's check if the resulting order is the optimal one and if the algorithm works fine:
+
+```{r Check Greedy2 R}
+# Original problem
+mat_list = list(A, B, C, D, E)
+
+# Greedy algorithm
+greedy2_ord <- greedy2_R(matrix_list = mat_list)
+print(greedy2_ord)
+
+# Operations needed
+operations_R(matrix_list = mat_list, order =  greedy2_ord)
+```
+
+As commented, the algorithm doesn't provide the optimal order. The resulting one, $(2,3,4,1)$ incurs in $271500$ operations, which are much lower than the naive approach, which requires $1100000$ operations. Still, it is a fairly acceptable approximation to the optimal $160000$ operations needed for the optimal solution.
+
+Let's implement this algorithm in `Rcpp`, for which we just need to take extra care when indexing:
+
+```{Rcpp Greedy2_Rcpp}
+// greedy2_Rcpp
+//
+// Greedy algorithm  for matrix multiplication which prioritizes the products 
+// which locally minimize the operation needed to perform them
+//
+// **Input Parameters:**
+// 1. **matrix_list**:
+//    List with matrices to be multiplied
+//
+// **Output:**
+// Returns a vector with approximately optimal order
+// 
+#include <RcppArmadillo.h>
+// [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::export]]
+arma::uvec greedy2_Rcpp(Rcpp::List matrix_list) {
+  int n = matrix_list.size();
+  arma::uvec dims(n + 1);
+  arma::uvec order(n - 1);
+  arma::uvec avail(n + 1, arma::fill::ones);
+  
+  // Extract matrix dimensions
+  arma::mat first_matrix = matrix_list[0];
+  dims[0] = first_matrix.n_rows;
+  dims[1] = first_matrix.n_cols;
+  
+  for (int i = 1; i < n; ++i) {
+    arma::mat mat = matrix_list[i];
+    dims[i + 1] = mat.n_cols;
+  }
+  
+  // Initialize available indices
+  arma::uvec indices = arma::regspace<arma::uvec>(0, n - 1); 
+  
+  for (int i = 0; i < n - 1; ++i) {
+    // Obtain available indices
+    arma::uvec temp_idx = arma::find(avail == 1);
+    
+    int m = temp_idx.n_elem;
+    arma::uvec costs(m - 2);
+    
+    for (int j = 1; j < m - 1; ++j) {
+      costs[j - 1] = dims[temp_idx[j - 1]] * dims[temp_idx[j]] *
+                     dims[temp_idx[j + 1]];
+    }
+    
+    // Find index of minimum multiplication cost
+    int min_idx = arma::index_min(costs); 
+    int idx_left = temp_idx[min_idx];
+    int idx_right = temp_idx[min_idx + 1];
+    
+    // Store multiplication order
+    order[i] = idx_right - 1;
+    
+    // Update dimensions to account for the product
+    dims[idx_left] = dims[idx_right];
+    
+    // Indicate already used right matrix
+    avail[idx_right] = 0;
+  }
+  
+  // Return the order + 1 for R indexing 
+  return order + 1; 
+}
+
+```
+
+Let's check if the algorithm works fine:
+
+```{r Check Greedy2 Rcpp}
+# Original problem
+mat_list = list(A, B, C, D, E)
+
+# Greedy algorithm
+greedy2_ord <- as.vector(greedy2_Rcpp(matrix_list = mat_list))
+print(greedy2_ord)
+
+# Operations needed
+operations_R(matrix_list = mat_list, order =  greedy2_ord)
+```
+
+Now, in the scope of this project, it is a shame that the proposed greedy algorithms can't be (at least easily) parallelized, since for `greedy2` each iteration directly depends on the previous one. Nonetheless, they are fairly low-cost algorithms.
+
+Let's compare the two of them for the expanded problem. In the following benchmark we will exclusively consider the time required to run the algorithm, not whether or not the algorithm has given a better approximation to the optimal solution, since this condition is totally foreign to the algorithms.
+
+```{r Greedy Benchmark}
+# New product
+mat_list = list(A, B, C, D, E, F, A, B, C, D, E, F, A, B, C, D, E, F)
+
+# Benchmark the four methods considered
+results = benchmark(
+  greedy1_R(matrix_list = mat_list),
+  greedy1_Rcpp(matrix_list = mat_list),
+  greedy2_R(matrix_list = mat_list),
+  greedy2_Rcpp(matrix_list = mat_list),
+  replications = 10000,
+  columns = c("test", "elapsed", "relative", "replications"),
+  order = "relative"
+)
+
+# Format the results
+results$test = c('Greedy1 R', 'Greedy2 Rcpp', 'Greedy1 Rcpp', 'Greedy2 R')
+row.names(results) = NULL
+
+# Display the styled table
+kable(results, caption = "Dynamic Algorithm comparison", align = "l", 
+      format = "markdown")
+```
+
+The results of this benchmark are surprising:
+
+-   The most efficient algorithm resulted `greedy_1_R` with a significative difference. This is probably due to the fact that the `sort` function in R is already optimized, and 'stepping-in' into `Rcpp` doesn't benefit. Instead, it hinders the algorithm efficiency, potentially due to certain data structure wrappings needed to use the `greedy_1_Rcpp` and differences in implementation between R's `sort` and Armadillo's `arma::sort_index`. In fact, `greedy_1_Rcpp` is almost 7 times slower than `greedy_1_R`.
+-   `greedy_2_Rcpp` is around 3 times faster than `greedy_1_Rcpp` although the implementation is much more convoluted. This evidences that manually performing loops in `Rcpp` results much more efficient than calling `arma::sort_index` even taking into account that `greedy2_Rcpp` is more memory-intensive than `greedy1_Rcpp`.
+-   The least efficient algorithm is `greedy2_R`, which evidences that looping in `Rcpp` is significantly more efficient than in `R`. As expected, `greedy2_R` is 12.5 times slower than `greedy1_R`, but this due tothe fact that `sort` seems to be very optimized.
+
+## Algorithm comparison
+
+To sum up, we have introduced several algorithms, in `R` and `Rcpp`: Two exact algorithms, the Brute-Force one and Dynamic programming and two greedy algorithms.
+
+We will now put them into practice and, among each type of algorithm, select the best one, create a wrapper function which encompasses the function for order selection and `Order_Mat_Mult_Rcpp` so as to account for the whole 'order + multiplication' procedure
+
+-   The **most efficient exact algorithm** resulted `Dynamic_Ordering_Rcpp` without parallelization.
+-   the **most efficient greedy algorithm** resulted `greedy1_R`, although we will also include `greedy2_Rcpp` because they do not necessarily output the same order.
+
+```{r Wrapper functions}
+# Construct the wrapper functions:
+
+# Exact Order
+exact_alg = function(mat_list){
+  # Obtain the optimal multiplication order
+  ord = Dynamic_Ordering_Rcpp(mat_list)
+  # Perform the multiplication in teh resulting order
+  return(Order_Mat_Mult_Rcpp(mat_list = mat_list, ord = ord))
+}
+
+# Greedy1 Order
+greedy1_alg = function(mat_list){
+  # Obtain the optimal multiplication order
+  ord = greedy1_R(mat_list)
+  # Perform the multiplication in teh resulting order
+  return(Order_Mat_Mult_Rcpp(mat_list = mat_list, ord = ord))
+}
+
+
+# Greedy2 Order
+greedy2_alg = function(mat_list){
+  # Obtain the optimal multiplication order
+  ord = greedy2_Rcpp(mat_list)
+  # Perform the multiplication in teh resulting order
+  return(Order_Mat_Mult_Rcpp(mat_list = mat_list, ord = ord))
+}
+
+# R best
+R_best = function(A,B,C,D,E) (A %*% B) %*% ((C %*% D) %*% E)
+
+# R naive
+R_naive = function(A,B,C,D,E) A %*% B %*% C %*% D %*% E
+
+# Rcpp naive
+Rcpp_naive = function(A,B,C,D,E) Naive_Rcpp(A,B,C,D,E)
+```
+
+Let's now perform the benchmark for the original example:
+
+```{r Final Benchmark}
+# Old product
+mat_list = list(A, B, C, D, E)
+
+# Benchmark the four methods considered
+results = benchmark(
+  exact_alg(mat_list),
+  greedy1_alg(mat_list),
+  greedy2_alg(mat_list),
+  R_best(A,B,C,D,E),
+  R_naive(A,B,C,D,E),
+  Rcpp_naive(A,B,C,D,E),
+  replications = 1000,
+  columns = c("test", "elapsed", "relative", "replications"),
+  order = "relative"
+)
+
+# Format the results
+results$test = c('R Best', 'Greedy1 R', 'Exact Rcpp', 'Greedy2 Rcpp', 
+                 'Rcpp Naive', 'R Naive')
+row.names(results) = NULL
+
+# Display the styled table
+kable(results, caption = "Final Wrapper Algorithm comparison", align = "l", 
+      format = "markdown")
+```
+
+We conclude the following:
+
+-   Unsurprisingly, `R_best` was the most efficient algorithm. As commented previously, directly knowing the optimal order and avoiding extra computations, alongside an optimized matrix product in `R` (equally-optimized as `Rcpp`) leads to really fast functions, but those are hindered by the non-generalizable context.
+-   `R_naive` was -by a considerable margin- the worst algorithm, since we have already seen in Task 1 that it needs to perform 1100000 operations, which definitely outweights the time taken to both approximate and find the optimal ordering. As well, `Rcpp_naive` performed poorly, although much better than `R_naive`.
+-   The second best was `greedy1_R`, which is logical, since it was by far the fastest order-estimating function and we have empirically tested that it outputs the optimal solution so, in this situation, in comparison with `Dynamic_Ordering_Rcpp`, it is objectively better.
+-   Surprisingly, the third best algorithm was the exact `Dynamic_Ordering_Rcpp`. It performed better than `greedy2_Rcpp` even when it took more time to obtain the parenthesization. This is potentially due to the fact that we have seen that `greedy2_Rcpp` doesn't output the optimal order. Therefore, even though `greedy2_Rcpp` took less time to estimate the order, the non-exactness of its solution hindered the overall performance of the wrapper.
+
+It would be interesting to see if augmenting the problem's dimensions makes any difference in the benchmarking results. Let's then compare the expanded problem:
+
+```{Rcpp Naive2_Rcpp}
+// Naive2_Rcpp
+//
+// Function which, given6 matrices in order, performs their naive 
+// multiplication order three time.
+//
+// **Input Parameters:**
+// 1. **A1, A2, A3, A4, A5, A6**:  
+//    Matrices with conformable dimensions.
+//
+// **Output:**
+// Returns the result of (A1*A2*A3*A4*A5*A6)^3
+//
+#include <RcppArmadillo.h> 
+// [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::export]]
+arma::mat Naive2_Rcpp(const arma::mat& A1, const arma::mat& A2,
+                     const arma::mat& A3, const arma::mat& A4, 
+                     const arma::mat& A5, const arma::mat& A6){
+
+  // Directly multiply the matrices
+  arma::mat result = A1 * A2 * A3 * A4 * A5 * A6 * A1 * A2 * A3 * A4 * A5 *
+                     A6 * A1 * A2 * A3 * A4 * A5 * A6;
+
+  return result;
+}
+```
+
+```{r Final Benchmark2}
+# New product
+mat_list = list(A, B, C, D, E, F, A, B, C, D, E, F, A, B, C, D, E, F)
+
+# New R_Best
+# R best (3  4  5  6  7  9 10 11 12 13  8  2  1 15 16 17 14)
+R_best2 = function(A,B,C,D,E,F){(A %*% (B %*% ((C %*% D) %*% E))) %*%
+    (((F %*% A) %*% B) %*% ((((C %*% D) %*% E) %*% F) %*% A)) %*%
+    (B %*% (((C %*% D) %*% E) %*% F))}
+
+# New R_naive
+R_naive2 = function(A,B,C,D,E,F){A %*% B %*% C %*% D %*% E %*%
+    F %*% A %*% B %*% C %*% D %*% E %*% F %*% A %*%
+    B %*% C %*% D %*% E %*% F}
+
+# Rcpp naive
+Rcpp_naive2 = function(A,B,C,D,E,F){ Naive2_Rcpp(A, B, C, D, E, F)}
+
+# Benchmark the four methods considered
+results = benchmark(
+  exact_alg(mat_list),
+  greedy1_alg(mat_list),
+  greedy2_alg(mat_list),
+  R_best2(A,B,C,D,E, F),
+  R_naive2(A,B,C,D,E, F),
+  Rcpp_naive2(A,B,C,D,E, F),
+  replications = 200,
+  columns = c("test", "elapsed", "relative", "replications"),
+  order = "relative"
+)
+
+# Format the results
+results$test = c('R Best', 'Exact Rcpp', 'Greedy1 R', 'Rcpp Naive', 'R Naive', 
+                 'Greedy2 Rcpp')
+row.names(results) = NULL
+
+# Display the styled table
+kable(results, caption = "Final Wrapper Algorithm comparison - Extended", 
+      align = "l", format = "markdown")
+```
+
+-   Surprisingly, this time it was `Dynamic_Ordering_Rcpp` the most efficient algorithm (excluding `R_best`), barely faster than `greedy1_R`. This is potentially due to the fact that, maybe the lack of optimality of `greedy1_R`'s output is slightly unworthy in comparison to the computational cost to obtain the best order, although they are effectively performance-tied.
+-   Another surprise was that `greedy2_Rcpp` performed even worse than `Rcpp_naive` and `R_naive`. This may be blamed to the fact that maybe the estimated order isn't much better than the naive one and, as such, the overhead of estimating hinders the overall performance of the wrapper, making it performance-like unworthy.
+-   The performance difference between `Rcpp_naive` and `R_naive` diminishes for this bigger problem, but `Rcpp_naive` is still faster.
+
+# Conclusions
+
+To conclude this assignment, it is necessary to make reference to other **MCOP** algorithms which, due to time constraints, we weren't able to cover:
+
+-   The **memoization algorithm** is another exact, classical approach similar to the dynamic algorithm which exploits recursivity.
+-   There are other, much more sophisticated approaches, which achieve optimality with a complexity of $O(n\log n)$. That is, they are as fast (asymptotically) as our `greedy1` without being non-exact. Those approaches exploit certain geometrical intricacies which relate parenthesization with polygon triangularization. To note Hu & Shing's algorithm, which is implemented in `C++` [here](https://github.com/nehark99/Hu-Shing-Algorithm-MCOP).
+-   There are certain approximate solutions (check [Chin-Hu-Shing](https://en.wikipedia.org/wiki/Matrix_chain_multiplication)) which perform fairly well with a complexity of $O(n)$, which, again is significantly faster than our approximate approaches.
+
+In this assignment We have covered the **Matrix Chain Ordering Problem**: we implemented, compared and tested several algorithms in both `R` and `Rcpp` of exact and approximate nature. For the dynamic approach, we were able try different types of parallelization and argued that it is not always a beneficial alternative to consider, particularly if the task to be parallelized isn't 'big' enough. And finally, we compared and reflected on whether the extra computation time needed to estimate and/or obtain the optimal parenthesization was worth it in several proposed situations.
+
+To wrap my personal thoughts: Every time that it is computationally-tractable I'd use the exact approach (`Dynamic_Ordering_Rcpp`), since it seems to be of particular usefulness for bigger matrix chains and, for smaller ones, the extra complexity will potentially be negligible. In the case in which assuming complexity $O(n^3)$ is untractable, I'd use `greedy1_R` since it has shown to perform fairly better than `greedy2` in any of its implementations and, in the worst case scenario, it seemed to roughly tie performance-wise with the exact approach.
+
+# References
+
+The resources and webpages used in this project are listed below:
+
+-   [GitHub: Dynamic Programming Questions by Aditya Verma](https://github.com/shubham-chemate/Dynamic-Programming-Questions-by-Aditya-Verma)
+-   [Wikipedia: Matrix Chain Multiplication](https://en.wikipedia.org/wiki/Matrix_chain_multiplication)
+-   [Dynamic Programming Slides](https://people.engr.tamu.edu/andreas-klappenecker/csce629-f17/csce411-set6c.pdf)
+-   [University of Edinburgh: Dynamic Programming](https://www.inf.ed.ac.uk/teaching/courses/ads/Current/lecture12.13.pdf)
+-   [GeeksforGeeks: Introduction to Greedy Algorithm](https://www.geeksforgeeks.org/introduction-to-greedy-algorithm-data-structures-and-algorithm-tutorials/)
+-   [Notes on RcppParallel](https://rcppcore.github.io/RcppParallel/)
+-   [Notes on rparallel](https://www.mjandrews.org/notes/rparallel/)
